@@ -1,13 +1,9 @@
 """
-Metodos para resolver sistemas de ecuaciones lineales A x = b.
+Sistemas de ecuaciones lineales A x = b.
 
-SEGUNDA IDEA DE LA OPTIMIZACION
--------------------------------
-Gauss-Seidel y Gauss-Jacobi se escriben normalmente como dos algoritmos
-separados, pero la diferencia entre ellos cabe en una sola linea: Jacobi
-usa los valores de la iteracion anterior durante todo el barrido, Seidel
-usa los que acaba de calcular.  Aqui hay una unica funcion `_iterativo`
-con un interruptor booleano, y dos envoltorios de dos lineas cada uno.
+- Gauss-Jordan  (con pivoteo parcial opcional y registro de cada paso)
+- Gauss-Seidel y Gauss-Jacobi (la misma funcion; cambia un booleano)
+- Algoritmo de Thomas (tridiagonales)
 """
 
 from dataclasses import dataclass, field
@@ -16,303 +12,214 @@ from itertools import permutations
 import numpy as np
 import pandas as pd
 
-CERO = 1e-12
+CERO = 1e-14
 
 
-class ErrorDeMetodo(Exception):
-    """El sistema no se puede resolver con el metodo elegido."""
+class ErrorDeSistema(Exception):
+    pass
 
 
 @dataclass
-class Resultado:
+class ResultadoSistema:
     solucion: np.ndarray | None = None
     tabla: pd.DataFrame = field(default_factory=pd.DataFrame)
-    convergio: bool = True
+    pasos: list = field(default_factory=list)      # [(titulo, DataFrame)]
     mensaje: str = ""
-    pasos: list = field(default_factory=list)      # [(titulo, matriz), ...]
-    avisos: list = field(default_factory=list)
-    historial: list = field(default_factory=list)  # error por iteracion
+    convergio: bool = True
+    extra: dict = field(default_factory=dict)
 
 
-def _validar(A, b):
-    A = np.array(A, dtype=float)
-    b = np.array(b, dtype=float).flatten()
-    if A.ndim != 2 or A.shape[0] != A.shape[1]:
-        raise ErrorDeMetodo("La matriz de coeficientes debe ser cuadrada.")
-    if A.shape[0] != b.size:
-        raise ErrorDeMetodo("El numero de ecuaciones no coincide con el de terminos independientes.")
-    return A, b
+def _matriz_aumentada(M, nombres):
+    return pd.DataFrame(M, columns=list(nombres) + ["| b"])
 
 
-def residuo(A, b, x):
-    """Norma del residuo ||Ax - b||: sirve para verificar cualquier solucion."""
-    return float(np.linalg.norm(A @ x - b, np.inf))
+# ----------------------------------------------------------- Gauss-Jordan
 
-
-# ------------------------------------------------------------ Gauss-Jordan
-
-def gauss_jordan(A, b):
-    """
-    Reduce la matriz aumentada hasta la identidad, con pivoteo parcial.
-    Guarda cada matriz intermedia para poder mostrar el procedimiento.
-    """
-    A, b = _validar(A, b)
+def gauss_jordan(A, b, nombres, pivoteo=True):
     n = len(b)
-    M = np.hstack([A, b.reshape(-1, 1)])
-    pasos = [("Matriz aumentada inicial", M.copy())]
-    avisos = []
+    M = np.hstack([A.astype(float), b.reshape(-1, 1).astype(float)])
+    pasos = [("Matriz aumentada inicial", _matriz_aumentada(M.copy(), nombres))]
 
     for i in range(n):
-        # pivoteo parcial: se sube la fila con el mayor coeficiente
-        fila_pivote = i + int(np.argmax(np.abs(M[i:, i])))
-        if abs(M[fila_pivote, i]) < CERO:
-            raise ErrorDeMetodo(
-                f"La columna {i + 1} no tiene pivote valido: el sistema no tiene "
-                "solucion unica (es singular o tiene infinitas soluciones)."
-            )
-        if fila_pivote != i:
-            M[[i, fila_pivote]] = M[[fila_pivote, i]]
-            avisos.append(f"Se intercambiaron las filas {i + 1} y {fila_pivote + 1} (pivoteo parcial).")
-            pasos.append((f"Intercambio F{i + 1} <-> F{fila_pivote + 1}", M.copy()))
+        if pivoteo:
+            p = i + int(np.argmax(np.abs(M[i:, i])))
+        else:
+            p = i
+            if abs(M[i, i]) < CERO:                  # sin pivoteo: solo cambia si hay cero
+                candidatos = [k for k in range(i + 1, n) if abs(M[k, i]) > CERO]
+                p = candidatos[0] if candidatos else i
+        if abs(M[p, i]) < CERO:
+            raise ErrorDeSistema("La matriz es singular: el sistema no tiene solucion unica.")
+        if p != i:
+            M[[i, p]] = M[[p, i]]
+            pasos.append((f"Intercambio F{i+1} ↔ F{p+1}", _matriz_aumentada(M.copy(), nombres)))
 
-        pivote = M[i, i]
-        M[i] = M[i] / pivote
-        pasos.append((f"F{i + 1} -> F{i + 1} / {pivote:.6g}", M.copy()))
-
+        piv = M[i, i]
+        M[i] = M[i] / piv
+        operaciones = [f"F{i+1} ← F{i+1} / {piv:.6g}"]
         for j in range(n):
             if j != i and abs(M[j, i]) > CERO:
                 factor = M[j, i]
                 M[j] = M[j] - factor * M[i]
-                pasos.append((f"F{j + 1} -> F{j + 1} - ({factor:.6g}) F{i + 1}", M.copy()))
+                operaciones.append(f"F{j+1} ← F{j+1} − ({factor:.6g})·F{i+1}")
+        pasos.append(("; ".join(operaciones), _matriz_aumentada(M.copy(), nombres)))
 
-    solucion = M[:, -1]
-    return Resultado(
-        solucion=solucion,
-        pasos=pasos,
-        avisos=avisos,
-        mensaje=f"Solucion exacta obtenida en {len(pasos) - 1} operaciones elementales. "
-                f"Residuo ||Ax-b|| = {residuo(A, b, solucion):.2e}",
-    )
+    x = M[:, -1].copy()
+    tabla = pd.DataFrame({"Incognita": nombres, "Valor": x})
+    return ResultadoSistema(solucion=x, tabla=tabla, pasos=pasos,
+                            mensaje="Matriz reducida a la identidad: la ultima columna es la solucion.")
 
 
-# ------------------------------------------- Gauss-Seidel y Gauss-Jacobi
+# ------------------------------------------------- Seidel / Jacobi
 
-def radio_espectral(A, usar_actualizados):
-    """
-    Radio espectral de la matriz de iteracion.  Es EL criterio de convergencia:
-    el metodo converge (desde cualquier punto inicial) si y solo si rho < 1.
-
-        Jacobi        T = -D^-1 (L + U)
-        Gauss-Seidel  T = -(D + L)^-1 U
-    """
+def radio_espectral(A, seidel):
     D = np.diag(np.diag(A))
     L = np.tril(A, -1)
     U = np.triu(A, 1)
     try:
-        T = -np.linalg.inv(D + L) @ U if usar_actualizados else -np.linalg.inv(D) @ (L + U)
-        return float(np.max(np.abs(np.linalg.eigvals(T))))
+        if seidel:
+            T = -np.linalg.solve(D + L, U)
+        else:
+            T = -np.linalg.solve(D, L + U)
     except np.linalg.LinAlgError:
-        return np.inf
+        return float("inf")
+    return float(max(abs(np.linalg.eigvals(T))))
 
 
-def es_dominante(A):
-    n = A.shape[0]
-    return all(abs(A[i, i]) >= np.sum(np.abs(A[i])) - abs(A[i, i]) - CERO for i in range(n))
+def es_diagonal_dominante(A):
+    d = np.abs(np.diag(A))
+    resto = np.sum(np.abs(A), axis=1) - d
+    return bool(np.all(d >= resto) and np.any(d > resto))
 
 
-def _orden_voraz(A):
-    """Para sistemas grandes: asigna a cada columna la fila de mayor coeficiente."""
-    n = A.shape[0]
-    M = np.abs(A.copy())
-    orden = [None] * n
-    for _ in range(n):
-        i, j = np.unravel_index(np.argmax(M), M.shape)
-        orden[j] = int(i)
-        M[i, :] = -1
-        M[:, j] = -1
-    return orden
+def mejor_orden(A, seidel):
+    """Prueba reordenar filas para que el metodo converja (menor radio espectral)."""
+    n = len(A)
+    original = radio_espectral(A, seidel) if np.all(np.abs(np.diag(A)) > CERO) else float("inf")
+    if n > 7:
+        return list(range(n)), original, original
+    mejor, rho_mejor = list(range(n)), original
+    for perm in permutations(range(n)):
+        B = A[list(perm)]
+        if np.any(np.abs(np.diag(B)) < CERO):
+            continue
+        rho = radio_espectral(B, seidel)
+        if rho < rho_mejor - 1e-12:
+            mejor, rho_mejor = list(perm), rho
+    return mejor, original, rho_mejor
 
 
-def _mejor_orden(A, usar_actualizados):
-    """
-    Elige la permutacion de ecuaciones que mejor sirve al metodo iterativo.
+def iterativo(A, b, nombres, seidel=True, x0=None, tol=1e-6, max_iter=100,
+              criterio="tolerancia", tipo_error="relativo %", reordenar=True):
+    n = len(b)
+    A = A.astype(float)
+    b = b.astype(float)
+    extra = {}
 
-    En el cuaderno original este reordenamiento estaba hecho a mano y sin
-    explicarlo (las ecuaciones estaban emparejadas con formulas de otras
-    filas).  Aqui el programa lo hace solo, y ademas justifica la eleccion
-    con el radio espectral.
-    """
-    n = A.shape[0]
-    candidatas = list(permutations(range(n))) if n <= 6 else [
-        tuple(range(n)), tuple(_orden_voraz(A))
+    if reordenar:
+        orden, rho0, rho1 = mejor_orden(A, seidel)
+        extra.update({"rho_original": rho0, "rho_final": rho1, "orden": orden})
+        if orden != list(range(n)):
+            A, b = A[orden], b[orden]
+            extra["reordenado"] = True
+    else:
+        extra["rho_final"] = radio_espectral(A, seidel)
+    if np.any(np.abs(np.diag(A)) < CERO):
+        raise ErrorDeSistema("Hay un cero en la diagonal; reordena las ecuaciones.")
+
+    extra["A"], extra["b"] = A, b
+    extra["despejes"] = [
+        f"{nombres[i]} = (" + f"{b[i]:g}" + "".join(
+            f" {'-' if A[i, j] > 0 else '+'} {abs(A[i, j]):g}{nombres[j]}"
+            for j in range(n) if j != i and abs(A[i, j]) > CERO
+        ) + f") / {A[i, i]:g}"
+        for i in range(n)
     ]
 
-    mejor, mejor_puntaje = None, None
-    for P in candidatas:
-        M = A[list(P)]
-        if np.min(np.abs(np.diag(M))) < CERO:
-            continue                       # cero en la diagonal: inservible
-        puntaje = (0 if es_dominante(M) else 1, radio_espectral(M, usar_actualizados))
-        if mejor_puntaje is None or puntaje < mejor_puntaje:
-            mejor, mejor_puntaje = list(P), puntaje
-
-    if mejor is None:
-        raise ErrorDeMetodo(
-            "No existe forma de reordenar las ecuaciones para evitar un cero en "
-            "la diagonal. Los metodos iterativos no se pueden aplicar a este sistema."
-        )
-    return mejor, mejor != list(range(n)), mejor_puntaje[0] == 0, mejor_puntaje[1]
-
-
-def _iterativo(A, b, x0=None, tol=1e-6, max_iter=100, usar_actualizados=False):
-    """Motor comun. usar_actualizados=False -> Jacobi ; True -> Gauss-Seidel."""
-    A, b = _validar(A, b)
-    n = len(b)
-
-    orden, se_reordeno, dominante, rho = _mejor_orden(A, usar_actualizados)
-    A, b = A[orden], b[orden]
-
-    avisos = []
-    if se_reordeno:
-        avisos.append(
-            "Se reordenaron las ecuaciones como "
-            + " , ".join(f"E{i + 1}" for i in orden)
-            + " para que el metodo pueda converger. El sistema es el mismo: "
-            "solo cambia el orden en que se escriben las ecuaciones."
-        )
-    if dominante:
-        avisos.append("La matriz es diagonalmente dominante: la convergencia esta garantizada.")
-    avisos.append(
-        f"Radio espectral de la matriz de iteracion: rho = {rho:.4f}. "
-        + ("Como rho < 1, el metodo converge." if rho < 1 else
-           "Como rho >= 1, el metodo NO converge con ningun valor inicial.")
-    )
-
-    nombres = [f"x{i + 1}" for i in range(n)]
-    x = np.zeros(n) if x0 is None else np.array(x0, dtype=float).flatten()
-    filas, historial = [], []
+    x = np.zeros(n) if x0 is None else np.array(x0, dtype=float)
+    filas = [{"Iter": 0, **{nombres[i]: x[i] for i in range(n)}}]
     convergio, mensaje = False, ""
 
     for k in range(1, int(max_iter) + 1):
-        anterior = x.copy()
-        nuevo = anterior.copy()
-
+        viejo = x.copy()
+        nuevo = x.copy()
         for i in range(n):
-            base = nuevo if usar_actualizados else anterior
-            suma = A[i] @ base - A[i, i] * base[i]
-            nuevo[i] = (b[i] - suma) / A[i, i]
-
-        if not np.all(np.isfinite(nuevo)) or np.max(np.abs(nuevo)) > 1e14:
-            mensaje = f"El metodo diverge en la iteracion {k}."
-            break
-
-        error = float(np.max(np.abs(nuevo - anterior)))
-        porcentual = float(
-            np.max(np.abs((nuevo - anterior) / np.where(np.abs(nuevo) < CERO, 1, nuevo))) * 100
-        )
-        filas.append(
-            {"Iter": k, **dict(zip(nombres, nuevo)), "Error abs.": error, "Error %": porcentual}
-        )
-        historial.append(error)
+            fuente = nuevo if seidel else viejo
+            s = sum(A[i, j] * fuente[j] for j in range(n) if j != i)
+            nuevo[i] = (b[i] - s) / A[i, i]
         x = nuevo
 
-        if error <= tol:
+        abs_ = np.abs(x - viejo)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = np.where(np.abs(x) > CERO, abs_ / np.abs(x) * 100, abs_ * 100)
+        fila = {"Iter": k, **{nombres[i]: x[i] for i in range(n)}}
+        for i in range(n):
+            fila[f"Err {nombres[i]}" + (" %" if tipo_error != "absoluto" else "")] = (
+                rel[i] if tipo_error != "absoluto" else abs_[i]
+            )
+        filas.append(fila)
+
+        if not np.all(np.isfinite(x)) or np.max(np.abs(x)) > 1e14:
+            mensaje = f"El metodo diverge (iteracion {k})."
+            convergio = False
+            break
+        error = np.max(rel if tipo_error != "absoluto" else abs_)
+        if criterio == "tolerancia" and error <= tol:
             convergio = True
-            mensaje = f"Converge en {k} iteraciones con error {error:.2e}."
+            mensaje = f"Converge en {k} iteraciones (error maximo {error:.3e})."
             break
     else:
-        mensaje = f"Se alcanzo el maximo de {int(max_iter)} iteraciones sin cumplir la tolerancia."
+        convergio = criterio == "iteraciones"
+        mensaje = (f"Se hicieron las {int(max_iter)} iteraciones pedidas." if convergio
+                   else f"Se alcanzo el maximo de {int(max_iter)} iteraciones sin converger.")
 
-    if convergio:
-        mensaje += f" Residuo ||Ax-b|| = {residuo(A, b, x):.2e}"
-
-    return Resultado(
-        solucion=x,
-        tabla=pd.DataFrame(filas),
-        convergio=convergio,
-        mensaje=mensaje,
-        avisos=avisos,
-        historial=historial,
-    )
+    return ResultadoSistema(solucion=x, tabla=pd.DataFrame(filas), mensaje=mensaje,
+                            convergio=convergio, extra=extra)
 
 
-def gauss_jacobi(A, b, x0=None, tol=1e-6, max_iter=100):
-    """Todas las incognitas se actualizan con los valores de la iteracion previa."""
-    return _iterativo(A, b, x0, tol, max_iter, usar_actualizados=False)
+# ----------------------------------------------------------- Thomas
 
+def es_tridiagonal(A):
+    n = len(A)
+    return all(abs(A[i, j]) < CERO for i in range(n) for j in range(n) if abs(i - j) > 1)
 
-def gauss_seidel(A, b, x0=None, tol=1e-6, max_iter=100):
-    """Cada incognita usa de inmediato los valores recien calculados."""
-    return _iterativo(A, b, x0, tol, max_iter, usar_actualizados=True)
-
-
-# ------------------------------------------------------- Algoritmo de Thomas
 
 def diagonales(A):
-    """Extrae (subdiagonal, diagonal, superdiagonal) y verifica que sea tridiagonal."""
-    A = np.array(A, dtype=float)
-    n = A.shape[0]
-    fuera = [
-        (i + 1, j + 1)
-        for i in range(n)
-        for j in range(n)
-        if abs(i - j) > 1 and abs(A[i, j]) > CERO
-    ]
-    if fuera:
-        posiciones = ", ".join(f"({i},{j})" for i, j in fuera[:5])
-        raise ErrorDeMetodo(
-            "La matriz no es tridiagonal: hay coeficientes distintos de cero en "
-            f"{posiciones}. El algoritmo de Thomas solo aplica a matrices tridiagonales."
-        )
-    inferior = np.array([A[i, i - 1] for i in range(1, n)])
-    principal = np.array([A[i, i] for i in range(n)])
-    superior = np.array([A[i, i + 1] for i in range(n - 1)])
-    return inferior, principal, superior
+    n = len(A)
+    a = [0.0] + [A[i, i - 1] for i in range(1, n)]
+    bd = [A[i, i] for i in range(n)]
+    c = [A[i, i + 1] for i in range(n - 1)] + [0.0]
+    return a, bd, c
 
 
-def thomas(A, b):
-    """
-    Barrido hacia adelante y sustitucion hacia atras para matrices tridiagonales.
-    Cuesta O(n) en lugar de O(n^3): esa es toda su gracia.
-    """
-    A, b = _validar(A, b)
-    inferior, principal, superior = diagonales(A)
-    n = len(b)
-
-    c = np.zeros(n)   # superdiagonal modificada
-    d = np.zeros(n)   # termino independiente modificado
-
-    if abs(principal[0]) < CERO:
-        raise ErrorDeMetodo("El primer elemento de la diagonal es cero: no se puede iniciar el barrido.")
-    c[0] = (superior[0] / principal[0]) if n > 1 else 0.0
-    d[0] = b[0] / principal[0]
-
+def thomas(a, bd, c, d, nombres=None):
+    """a: subdiagonal (a[0]=0), bd: diagonal, c: superdiagonal (c[-1]=0), d: lado derecho."""
+    n = len(d)
+    if not (len(a) == len(bd) == len(c) == n):
+        raise ErrorDeSistema("Las cuatro listas a, b, c, d deben tener la misma longitud.")
+    nombres = nombres or [f"x{i+1}" for i in range(n)]
+    a, bd, c, d = (list(map(float, v)) for v in (a, bd, c, d))
+    bm, dm = bd.copy(), d.copy()
+    filas = [{"i": 1, "a_i": a[0], "b_i": bd[0], "c_i": c[0], "d_i": d[0],
+              "w_i": None, "b'_i": bm[0], "d'_i": dm[0]}]
     for i in range(1, n):
-        denominador = principal[i] - inferior[i - 1] * c[i - 1]
-        if abs(denominador) < CERO:
-            raise ErrorDeMetodo(f"Denominador nulo en la fila {i + 1}: el sistema es singular.")
-        c[i] = (superior[i] / denominador) if i < n - 1 else 0.0
-        d[i] = (b[i] - inferior[i - 1] * d[i - 1]) / denominador
-
-    x = np.zeros(n)
-    x[-1] = d[-1]
+        if abs(bm[i - 1]) < CERO:
+            raise ErrorDeSistema("Pivote cero en la eliminacion: Thomas no aplica (usa Gauss-Jordan).")
+        w = a[i] / bm[i - 1]
+        bm[i] = bd[i] - w * c[i - 1]
+        dm[i] = d[i] - w * dm[i - 1]
+        filas.append({"i": i + 1, "a_i": a[i], "b_i": bd[i], "c_i": c[i], "d_i": d[i],
+                      "w_i": w, "b'_i": bm[i], "d'_i": dm[i]})
+    if abs(bm[-1]) < CERO:
+        raise ErrorDeSistema("Pivote cero: el sistema es singular.")
+    x = [0.0] * n
+    x[-1] = dm[-1] / bm[-1]
     for i in range(n - 2, -1, -1):
-        x[i] = d[i] - c[i] * x[i + 1]
-
-    tabla = pd.DataFrame({
-        "Fila": range(1, n + 1),
-        "a (inferior)": np.concatenate([[np.nan], inferior]),
-        "b (diagonal)": principal,
-        "c (superior)": np.concatenate([superior, [np.nan]]),
-        "d (indep.)": b,
-        "c' modificada": c,
-        "d' modificada": d,
-        "Solucion": x,
-    })
-
-    return Resultado(
-        solucion=x,
-        tabla=tabla,
-        mensaje=f"Resuelto en un solo barrido (O(n) operaciones). "
-                f"Residuo ||Ax-b|| = {residuo(A, b, x):.2e}",
-    )
+        x[i] = (dm[i] - c[i] * x[i + 1]) / bm[i]
+    for i in range(n):
+        filas[i]["x_i"] = x[i]
+    tabla = pd.DataFrame(filas)
+    sol = pd.DataFrame({"Incognita": nombres, "Valor": x})
+    return ResultadoSistema(solucion=np.array(x), tabla=sol, pasos=[("Barrido", tabla)],
+                            mensaje="Eliminacion hacia adelante + sustitucion regresiva.",
+                            extra={"b_mod": bm, "d_mod": dm, "a": a, "b": bd, "c": c, "d": d})
